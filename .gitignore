@@ -1,0 +1,42 @@
+# Data (do not commit raw or processed data)
+data/
+*.csv
+.claude
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+ENV/
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# MLflow / models
+mlruns/
+mlartifacts/
+*.pkl
+*.joblib
+
+# Environments / secrets
+.env
+.env.*
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+
+# Testing / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
