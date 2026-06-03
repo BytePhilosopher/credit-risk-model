@@ -23,6 +23,7 @@ dist/
 # MLflow / models
 mlruns/
 mlartifacts/
+models/
 *.pkl
 *.joblib
 
