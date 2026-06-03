@@ -8,8 +8,11 @@ from src.data_processing import (
     AggregateFeatures,
     DateTimeFeatures,
     WOETransformer,
+    assign_high_risk_label,
     build_processing_pipeline,
+    build_target,
     calculate_woe_iv,
+    compute_rfm,
 )
 
 
@@ -99,3 +102,56 @@ def test_woe_transformer_maps_categories_to_numbers():
     # Unseen category falls back to neutral WoE (0).
     unseen = WOETransformer(columns=["cat"]).fit(df, y).transform(pd.DataFrame({"cat": ["z"]}))
     assert unseen["cat"].iloc[0] == 0.0
+
+
+@pytest.fixture
+def rfm_raw_df():
+    """Synthetic transactions with three clearly separable engagement groups."""
+    rows = []
+    # Engaged: many recent, high-value transactions.
+    for cid in ["E1", "E2", "E3"]:
+        for d in range(1, 16):
+            rows.append((cid, f"2019-02-{d:02d}T08:00:00Z", 5000))
+    # Mid: a handful of mid transactions.
+    for cid in ["M1", "M2", "M3"]:
+        for d in [1, 10, 20]:
+            rows.append((cid, f"2019-01-{d:02d}T08:00:00Z", 2000))
+    # Disengaged: one old, low-value transaction each (high-risk proxy).
+    for cid in ["D1", "D2", "D3", "D4"]:
+        rows.append((cid, "2018-11-15T08:00:00Z", 100))
+    return pd.DataFrame(rows, columns=["CustomerId", "TransactionStartTime", "Value"])
+
+
+def test_compute_rfm_shapes_and_values(rfm_raw_df):
+    rfm = compute_rfm(rfm_raw_df)
+    assert set(rfm.columns) == {"recency", "frequency", "monetary"}
+    assert rfm.loc["E1", "frequency"] == 15
+    assert rfm.loc["D1", "frequency"] == 1
+    # Disengaged customers are the least recent (largest recency).
+    assert rfm.loc["D1", "recency"] > rfm.loc["E1", "recency"]
+
+
+def test_assign_high_risk_label_flags_disengaged(rfm_raw_df):
+    rfm = compute_rfm(rfm_raw_df)
+    labeled, high_risk_cluster = assign_high_risk_label(rfm)
+    assert set(labeled["is_high_risk"].unique()) <= {0, 1}
+    # The disengaged customers should all be labelled high-risk.
+    for cid in ["D1", "D2", "D3", "D4"]:
+        assert labeled.loc[cid, "is_high_risk"] == 1
+    # The engaged customers should not be high-risk.
+    for cid in ["E1", "E2", "E3"]:
+        assert labeled.loc[cid, "is_high_risk"] == 0
+
+
+def test_assign_high_risk_label_is_reproducible(rfm_raw_df):
+    rfm = compute_rfm(rfm_raw_df)
+    _, c1 = assign_high_risk_label(rfm)
+    _, c2 = assign_high_risk_label(rfm)
+    assert c1 == c2
+
+
+def test_build_target_indexed_by_customer(rfm_raw_df):
+    target = build_target(rfm_raw_df)
+    assert target.name == "is_high_risk"
+    assert target.index.name == "CustomerId"
+    assert target.notna().all()
