@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+import joblib
 import mlflow
 import mlflow.sklearn
 import pandas as pd
@@ -42,6 +43,7 @@ from sklearn.metrics import (
     roc_auc_score,
 )
 from sklearn.model_selection import GridSearchCV, train_test_split
+from sklearn.pipeline import Pipeline
 
 from src.data_processing import RANDOM_STATE, build_processing_pipeline, build_target
 
@@ -49,21 +51,33 @@ TARGET = "is_high_risk"
 EXPERIMENT_NAME = "credit-risk-model"
 REGISTERED_MODEL_NAME = "credit-risk-classifier"
 
+# Local artifact path for the servable inference pipeline (preprocessing + model).
+MODEL_DIR = Path("models")
+MODEL_PATH = MODEL_DIR / "credit_risk_pipeline.joblib"
+
 
 # -----------------------------------------------------------------------------
 # Data preparation
 # -----------------------------------------------------------------------------
-def load_features_and_target(raw_path: str | Path) -> tuple[pd.DataFrame, pd.Series]:
-    """Build the customer-level feature matrix X and proxy target y from raw data."""
+def load_features_and_target(raw_path: str | Path):
+    """Build the customer-level feature matrix, proxy target, and fitted preprocessor.
+
+    Returns ``(X, y, column_transformer)`` where ``X`` is the encoded feature
+    matrix the classifier is trained on and ``column_transformer`` is the fitted
+    preprocessing step. The latter is combined with the best model into a single
+    servable inference pipeline that accepts customer-level aggregate features.
+    """
     raw = pd.read_csv(raw_path)
 
-    features = build_processing_pipeline().fit_transform(raw)
+    pipeline = build_processing_pipeline()
+    features = pipeline.fit_transform(raw)
     target = build_target(raw)
 
     data = features.join(target).dropna(subset=[TARGET])
     X = data.drop(columns=[TARGET])
     y = data[TARGET].astype(int)
-    return X, y
+    column_transformer = pipeline.named_steps["transform"]
+    return X, y, column_transformer
 
 
 def split_data(X: pd.DataFrame, y: pd.Series, test_size: float = 0.2):
@@ -183,7 +197,7 @@ def run_training(
         mlflow.set_tracking_uri(tracking_uri)
     mlflow.set_experiment(EXPERIMENT_NAME)
 
-    X, y = load_features_and_target(raw_path)
+    X, y, column_transformer = load_features_and_target(raw_path)
     X_train, X_test, y_train, y_test = split_data(X, y)
     print(f"Train: {X_train.shape}  Test: {X_test.shape}  Positive rate: {y.mean():.3f}")
 
@@ -201,10 +215,23 @@ def run_training(
         f"({selection_metric}={best['metrics'][selection_metric]:.4f})"
     )
 
-    # Register the best run's model in the MLflow Model Registry.
-    model_uri = f"runs:/{best['run_id']}/model"
-    mlflow.register_model(model_uri=model_uri, name=REGISTERED_MODEL_NAME)
-    print(f"Registered '{REGISTERED_MODEL_NAME}' from run {best['run_id']}")
+    # Assemble a servable inference pipeline: fitted preprocessing + best model.
+    # It accepts customer-level aggregate features and outputs a risk prediction.
+    inference_pipeline = Pipeline(
+        steps=[("preprocess", column_transformer), ("model", best["model"])]
+    )
+    MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    joblib.dump(inference_pipeline, MODEL_PATH)
+    print(f"Saved inference pipeline -> {MODEL_PATH}")
+
+    # Log + register the inference pipeline in the MLflow Model Registry.
+    with mlflow.start_run(run_name="best_inference_pipeline"):
+        mlflow.log_param("model_type", best["name"])
+        mlflow.log_metrics(best["metrics"])
+        mlflow.sklearn.log_model(
+            inference_pipeline, name="model", registered_model_name=REGISTERED_MODEL_NAME
+        )
+    print(f"Registered '{REGISTERED_MODEL_NAME}' (best: {best['name']})")
 
     return best
 
