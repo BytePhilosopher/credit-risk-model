@@ -1,0 +1,5 @@
+[tool.pytest.ini_options]
+# Add the project root to sys.path so `import src...` works when pytest is
+# invoked as a script (e.g. `pytest -q` in CI), not just via `python -m pytest`.
+pythonpath = ["."]
+testpaths = ["tests"]

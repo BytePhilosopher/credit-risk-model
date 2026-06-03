@@ -24,6 +24,8 @@ dist/
 mlruns/
 mlartifacts/
 models/
+mlflow.db
+*.db
 *.pkl
 *.joblib
 

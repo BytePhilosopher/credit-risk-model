@@ -51,6 +51,10 @@ TARGET = "is_high_risk"
 EXPERIMENT_NAME = "credit-risk-model"
 REGISTERED_MODEL_NAME = "credit-risk-classifier"
 
+# MLflow 3.x deprecated the bare file store (./mlruns); use a local SQLite backend
+# by default. Override with --tracking-uri or the MLFLOW_TRACKING_URI env var.
+DEFAULT_TRACKING_URI = "sqlite:///mlflow.db"
+
 # Local artifact path for the servable inference pipeline (preprocessing + model).
 MODEL_DIR = Path("models")
 MODEL_PATH = MODEL_DIR / "credit_risk_pipeline.joblib"
@@ -193,8 +197,7 @@ def run_training(
     selection_metric: str = "roc_auc",
 ) -> dict:
     """Full training workflow: load data, train candidates, register the best model."""
-    if tracking_uri:
-        mlflow.set_tracking_uri(tracking_uri)
+    mlflow.set_tracking_uri(tracking_uri or DEFAULT_TRACKING_URI)
     mlflow.set_experiment(EXPERIMENT_NAME)
 
     X, y, column_transformer = load_features_and_target(raw_path)
