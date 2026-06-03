@@ -14,7 +14,15 @@ Pipeline stages
 
 Credit risk is a property of the *customer*, not of a single transaction, so the
 pipeline aggregates to ``CustomerId``. The resulting feature table is what the
-proxy-target (Task 4) and the models (Task 5) consume.
+models (Task 5) consume.
+
+Proxy target (RFM)
+------------------
+The raw data has no default label, so an ``is_high_risk`` proxy is engineered
+from behaviour: per-customer Recency/Frequency/Monetary values are scaled and
+clustered with K-Means, and the least-engaged cluster (high recency, low
+frequency, low monetary) is labelled high-risk. ``build_target`` returns the
+label and :func:`process` merges it onto the feature table.
 
 Weight of Evidence / Information Value
 --------------------------------------
@@ -36,6 +44,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.cluster import KMeans
 from sklearn.compose import ColumnTransformer, make_column_selector
 from sklearn.impute import SimpleImputer
 from sklearn.pipeline import Pipeline
@@ -256,6 +265,83 @@ class WOETransformer(BaseEstimator, TransformerMixin):
 
 
 # -----------------------------------------------------------------------------
+# Proxy target: RFM segmentation + high-risk labelling
+# -----------------------------------------------------------------------------
+def compute_rfm(
+    raw: pd.DataFrame, snapshot_date: pd.Timestamp | None = None
+) -> pd.DataFrame:
+    """Compute Recency, Frequency and Monetary values per customer.
+
+    * **Recency** — days between the customer's last transaction and the
+      snapshot date (lower = more recently active).
+    * **Frequency** — number of transactions.
+    * **Monetary** — total absolute transaction value (uses ``Value`` so credits
+      and debits do not cancel out).
+
+    The snapshot date defaults to one day after the last transaction in the data,
+    making recency reproducible and independent of the current date.
+    """
+    df = raw.copy()
+    ts = pd.to_datetime(df[TIME_COL], utc=True, errors="coerce")
+    df[TIME_COL] = ts
+    if snapshot_date is None:
+        snapshot_date = ts.max() + pd.Timedelta(days=1)
+
+    rfm = df.groupby(CUSTOMER_ID).agg(
+        recency=(TIME_COL, lambda s: (snapshot_date - s.max()).days),
+        frequency=(TIME_COL, "count"),
+        monetary=(VALUE_COL, "sum"),
+    )
+    return rfm
+
+
+def assign_high_risk_label(
+    rfm: pd.DataFrame, n_clusters: int = 3, random_state: int = RANDOM_STATE
+) -> tuple[pd.DataFrame, int]:
+    """Cluster customers on scaled RFM and flag the least-engaged segment.
+
+    RFM features are standardised, then segmented with K-Means (fixed
+    ``random_state`` for reproducibility). The high-risk cluster is the one whose
+    centroid shows **high recency, low frequency and low monetary** value — the
+    disengaged customers used as a default proxy.
+
+    Returns the RFM table augmented with ``cluster`` and ``is_high_risk`` columns,
+    plus the index of the chosen high-risk cluster.
+    """
+    rfm = rfm.copy()
+    features = rfm[["recency", "frequency", "monetary"]]
+
+    scaler = StandardScaler()
+    scaled = scaler.fit_transform(features)
+
+    kmeans = KMeans(n_clusters=n_clusters, random_state=random_state, n_init=10)
+    rfm["cluster"] = kmeans.fit_predict(scaled)
+
+    # Rank clusters by a disengagement score built from centroids in RFM space.
+    centroids = rfm.groupby("cluster")[["recency", "frequency", "monetary"]].mean()
+    z = (centroids - centroids.mean()) / centroids.std(ddof=0).replace(0, 1)
+    # High recency raises risk; high frequency / monetary lower it.
+    risk_score = z["recency"] - z["frequency"] - z["monetary"]
+    high_risk_cluster = int(risk_score.idxmax())
+
+    rfm["is_high_risk"] = (rfm["cluster"] == high_risk_cluster).astype(int)
+    return rfm, high_risk_cluster
+
+
+def build_target(
+    raw: pd.DataFrame, snapshot_date: pd.Timestamp | None = None
+) -> pd.Series:
+    """Convenience wrapper: raw transactions -> ``is_high_risk`` Series.
+
+    The returned Series is indexed by ``CustomerId`` so it joins directly onto
+    the feature table produced by :func:`build_processing_pipeline`.
+    """
+    rfm = compute_rfm(raw, snapshot_date=snapshot_date)
+    labeled, _ = assign_high_risk_label(rfm)
+    return labeled["is_high_risk"]
+
+
+# -----------------------------------------------------------------------------
 # Pipeline construction
 # -----------------------------------------------------------------------------
 def build_column_transformer() -> ColumnTransformer:
@@ -324,13 +410,23 @@ def build_woe_pipeline(woe_columns: list[str] | None = None) -> Pipeline:
 # -----------------------------------------------------------------------------
 # CLI entry point
 # -----------------------------------------------------------------------------
-def process(input_path: str | Path, output_path: str | Path) -> pd.DataFrame:
-    """Read raw CSV, run the processing pipeline, and write the model-ready CSV."""
+def process(
+    input_path: str | Path, output_path: str | Path, with_target: bool = True
+) -> pd.DataFrame:
+    """Read raw CSV, build features (+ proxy target), and write the model-ready CSV.
+
+    When ``with_target`` is True, the RFM-based ``is_high_risk`` proxy label is
+    computed and merged onto the feature table by ``CustomerId``.
+    """
     input_path, output_path = Path(input_path), Path(output_path)
     raw = pd.read_csv(input_path)
 
     pipeline = build_processing_pipeline()
     features = pipeline.fit_transform(raw)
+
+    if with_target:
+        target = build_target(raw)
+        features = features.join(target)  # aligned on the CustomerId index
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     features.to_csv(output_path)
@@ -345,10 +441,20 @@ def main() -> None:
         default="data/processed/features.csv",
         help="Where to write the model-ready feature table.",
     )
+    parser.add_argument(
+        "--no-target",
+        action="store_true",
+        help="Skip computing the is_high_risk proxy target.",
+    )
     args = parser.parse_args()
 
-    features = process(args.input, args.output)
-    print(f"Wrote {features.shape[0]:,} customers x {features.shape[1]} features -> {args.output}")
+    features = process(args.input, args.output, with_target=not args.no_target)
+    cols = features.shape[1]
+    msg = f"Wrote {features.shape[0]:,} customers x {cols} columns -> {args.output}"
+    if "is_high_risk" in features.columns:
+        rate = features["is_high_risk"].mean() * 100
+        msg += f"  (high-risk: {features['is_high_risk'].sum():,} / {rate:.1f}%)"
+    print(msg)
 
 
 if __name__ == "__main__":
